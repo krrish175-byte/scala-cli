@@ -36,13 +36,11 @@ final case class FixOptions(
   @Tag(tags.experimental)
   @HelpMessage("Detect and suggest removing unused compile-time dependencies")
   @Tag(tags.inShortHelp)
-  @Name("withUnusedDeps")
   withUnusedDeps: Boolean = false,
   @Group(HelpGroup.Fix.toString)
   @Tag(tags.experimental)
   @HelpMessage("Detect and suggest adding missing explicit dependencies (transitive dependencies that are used)")
   @Tag(tags.inShortHelp)
-  @Name("withExplicitDeps")
   withExplicitDeps: Boolean = false
 ) extends HasSharedOptions {
   def areAnyRulesEnabled: Boolean = enableScalafix || enableBuiltInRules || withUnusedDeps || withExplicitDeps
