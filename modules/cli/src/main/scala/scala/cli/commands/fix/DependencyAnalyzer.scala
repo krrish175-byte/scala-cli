@@ -8,18 +8,52 @@ import scala.collection.mutable
 import scala.util.Try
 import scala.util.matching.Regex
 
+/** Analyzer for detecting unused and missing explicit dependencies in a Scala project.
+  *
+  * This object provides functionality similar to tools like sbt-explicit-dependencies and mill-explicit-deps:
+  * - Detects compile-time dependencies that are declared but not used
+  * - Detects transitive dependencies that are directly imported but not explicitly declared
+  *
+  * The analysis is based on static analysis of import statements and may produce false positives for
+  * dependencies used via reflection, service loading, or other dynamic mechanisms.
+  */
 object DependencyAnalyzer {
 
+  /** Result of analyzing project dependencies.
+    *
+    * @param unusedDependencies
+    *   dependencies that are declared but not used
+    * @param missingExplicitDependencies
+    *   transitive dependencies that are directly imported but not explicitly declared
+    */
   final case class DependencyAnalysisResult(
     unusedDependencies: Seq[UnusedDependency],
     missingExplicitDependencies: Seq[MissingDependency]
   )
 
+  /** A dependency that appears to be unused.
+    *
+    * @param dependency
+    *   the unused dependency
+    * @param reason
+    *   explanation of why it's considered unused
+    */
   final case class UnusedDependency(
     dependency: AnyDependency,
     reason: String
   )
 
+  /** A transitive dependency that is directly used but not explicitly declared.
+    *
+    * @param organizationModule
+    *   organization and module name (e.g., "org.example:my-lib")
+    * @param version
+    *   version of the dependency
+    * @param usedInFiles
+    *   source files that import this dependency
+    * @param reason
+    *   explanation of why it should be declared
+    */
   final case class MissingDependency(
     organizationModule: String,
     version: String,
@@ -30,6 +64,19 @@ object DependencyAnalyzer {
   // Regex to extract imports from Scala code
   private val importPattern: Regex = """^\s*import\s+([^\s{(]+).*""".r
 
+  /** Analyzes dependencies in a project to find unused and missing explicit dependencies.
+    *
+    * @param sources
+    *   project source files to analyze
+    * @param buildOptions
+    *   build configuration including declared dependencies
+    * @param artifacts
+    *   resolved artifacts including dependency resolution graph
+    * @param logger
+    *   logger for debug output
+    * @return
+    *   either an error message or a DependencyAnalysisResult
+    */
   def analyzeDependencies(
     sources: Sources,
     buildOptions: BuildOptions,
@@ -48,33 +95,40 @@ object DependencyAnalyzer {
     // Get transitive dependencies from resolution
     val resolutionOpt = artifacts.resolution
     
-    if (resolutionOpt.isEmpty) {
-      return Left("No dependency resolution available. Please compile the project first.")
+    if (resolutionOpt.isEmpty)
+      Left("No dependency resolution available. Please compile the project first.")
+    else {
+      val resolution = resolutionOpt.get
+
+      // Analyze unused dependencies
+      val unusedDeps = detectUnusedDependencies(
+        declaredDeps,
+        allImports,
+        logger
+      )
+
+      // Analyze missing explicit dependencies
+      val missingDeps = detectMissingExplicitDependencies(
+        declaredDeps,
+        allImports,
+        resolution,
+        sources,
+        logger
+      )
+
+      Right(DependencyAnalysisResult(unusedDeps, missingDeps))
     }
-
-    val resolution = resolutionOpt.get
-
-    // Analyze unused dependencies
-    val unusedDeps = detectUnusedDependencies(
-      declaredDeps,
-      allImports,
-      artifacts,
-      logger
-    )
-
-    // Analyze missing explicit dependencies
-    val missingDeps = detectMissingExplicitDependencies(
-      declaredDeps,
-      allImports,
-      resolution,
-      artifacts,
-      sources,
-      logger
-    )
-
-    Right(DependencyAnalysisResult(unusedDeps, missingDeps))
   }
 
+  /** Extracts all import statements from source files.
+    *
+    * @param sources
+    *   project source files
+    * @param logger
+    *   logger for error messages
+    * @return
+    *   set of unique import package names
+    */
   private def extractImports(sources: Sources, logger: Logger): Set[String] = {
     val imports = mutable.Set[String]()
 
@@ -110,10 +164,24 @@ object DependencyAnalyzer {
     imports.toSet
   }
 
+  /** Detects dependencies that are declared but appear to be unused.
+    *
+    * A dependency is considered unused if none of its package names are imported in the source code.
+    *
+    * @param declaredDeps
+    *   explicitly declared dependencies
+    * @param imports
+    *   set of imported packages
+    * @param artifacts
+    *   resolved artifacts
+    * @param logger
+    *   logger for debug output
+    * @return
+    *   list of potentially unused dependencies
+    */
   private def detectUnusedDependencies(
     declaredDeps: Seq[Positioned[AnyDependency]],
     imports: Set[String],
-    artifacts: Artifacts,
     logger: Logger
   ): Seq[UnusedDependency] = {
     
@@ -124,7 +192,7 @@ object DependencyAnalyzer {
     }
 
     // For each dependency, check if its packages are imported
-    val unused = depToArtifactMap.flatMap { case (dep, artifactId) =>
+    val unused = depToArtifactMap.flatMap { case (dep, _) =>
       // Common package name patterns from artifact names and organizations
       val possiblePackages = Set(
         dep.organization.replace('-', '.').toLowerCase,
@@ -152,11 +220,30 @@ object DependencyAnalyzer {
     unused
   }
 
+  /** Detects transitive dependencies that are directly imported but not explicitly declared.
+    *
+    * These dependencies are currently available transitively through other dependencies, but should be
+    * declared explicitly to ensure build stability if upstream dependencies change.
+    *
+    * @param declaredDeps
+    *   explicitly declared dependencies
+    * @param imports
+    *   set of imported packages
+    * @param resolution
+    *   dependency resolution graph
+    * @param artifacts
+    *   resolved artifacts
+    * @param sources
+    *   project source files
+    * @param logger
+    *   logger for debug output
+    * @return
+    *   list of missing explicit dependencies
+    */
   private def detectMissingExplicitDependencies(
     declaredDeps: Seq[Positioned[AnyDependency]],
     imports: Set[String],
     resolution: coursier.Resolution,
-    artifacts: Artifacts,
     sources: Sources,
     logger: Logger
   ): Seq[MissingDependency] = {
@@ -180,7 +267,7 @@ object DependencyAnalyzer {
     val missing = transitiveDeps.flatMap { dep =>
       val org = dep.module.organization.value
       val name = dep.module.name.value
-      val version = dep.version
+      val version = dep.versionConstraint.asString
 
       // Possible package names from org and module name
       val possiblePackages = Set(
@@ -214,6 +301,17 @@ object DependencyAnalyzer {
     missing.toSeq
   }
 
+  /** Finds which source files import the given packages.
+    *
+    * @param sources
+    *   project source files
+    * @param targetImports
+    *   set of package imports to search for
+    * @param logger
+    *   logger for error messages
+    * @return
+    *   list of source files that import these packages
+    */
   private def findFilesWithImports(
     sources: Sources,
     targetImports: Set[String],

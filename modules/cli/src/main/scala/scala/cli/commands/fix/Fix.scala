@@ -76,8 +76,6 @@ object Fix extends ScalaCommand[FixOptions] {
     logger.message("Analyzing project dependencies...")
     
     try {
-      val threads = BuildThreads.create()
-      val compilerMaker = options.shared.compilerMaker(threads)
       val (crossSources, _) = scala.build.CrossSources.forInputs(
         inputs,
         preprocessors = scala.build.Sources.defaultPreprocessors(
